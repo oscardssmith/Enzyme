@@ -1,4 +1,4 @@
-; RUN: if [ %llvmver -ge 17 ]; then %opt < %s %newLoadEnzyme -enzyme-preopt=false -passes="enzyme" -S | FileCheck %s; fi
+; RUN: if [ %llvmver -ge 15 ]; then %opt < %s %OPnewLoadEnzyme -enzyme-preopt=false -passes="enzyme" -S | FileCheck %s; fi
 
 ; Julia 1.14 attaches bundles to its allocations that tell its GC lowering to
 ; zero their pointer fields; the shadow allocation must carry them too.

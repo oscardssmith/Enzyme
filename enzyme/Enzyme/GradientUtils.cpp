@@ -3771,10 +3771,17 @@ BasicBlock *GradientUtils::prepRematerializedLoopEntry(LoopContext &lc) {
 
               anti = shadowHandlers[funcName](NB, orig, args, this);
             } else {
+              SmallVector<OperandBundleDef, 2> Defs;
+              if (hasJuliaAllocInitBundle(orig)) {
+                SmallVector<ValueType, 2> BundleTypes(args.size(),
+                                                      ValueType::Primal);
+                Defs = getInvertedBundles(orig, BundleTypes, NB,
+                                          /*lookup*/ true);
+              }
               auto rule = [&]() {
                 Value *anti = NB.CreateCall(orig->getFunctionType(),
                                             orig->getCalledOperand(), args,
-                                            orig->getName() + "'mi");
+                                            Defs, orig->getName() + "'mi");
                 cast<CallInst>(anti)->setAttributes(orig->getAttributes());
                 cast<CallInst>(anti)->setCallingConv(orig->getCallingConv());
                 cast<CallInst>(anti)->setDebugLoc(
@@ -3819,7 +3826,8 @@ BasicBlock *GradientUtils::prepRematerializedLoopEntry(LoopContext &lc) {
               applyChainRule(
                   NB,
                   [&](Value *anti) {
-                    zeroKnownAllocation(NB, anti, args, funcName, TLI, orig);
+                    zeroKnownAllocation(NB, anti, args, funcName, TLI, orig,
+                                        /*justAllocated*/ true);
                   },
                   anti);
             }

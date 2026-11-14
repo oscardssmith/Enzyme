@@ -3049,6 +3049,14 @@ static inline bool isJuliaAllocInitBundle(llvm::StringRef tag) {
          tag == "julia.gc_alloc_zeroinit_indirect";
 }
 
+/// Whether Julia's GC lowering will zero part of this allocation on its own.
+static inline bool hasJuliaAllocInitBundle(const llvm::CallBase *CB) {
+  for (unsigned i = 0, e = CB->getNumOperandBundles(); i != e; ++i)
+    if (isJuliaAllocInitBundle(CB->getOperandBundleAt(i).getTagName()))
+      return true;
+  return false;
+}
+
 // Find all user instructions of AI, returning tuples of <instruction, value,
 // byte offet from AI> Unlike a simple get users, this will recurse through any
 // constant gep offsets and casts

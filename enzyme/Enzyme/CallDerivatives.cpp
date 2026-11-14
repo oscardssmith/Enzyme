@@ -3689,10 +3689,19 @@ bool AdjointGenerator::handleKnownCallDerivatives(
             uint64_t idx = 0;
             Value *prev = nullptr;
             ;
+            // Julia's GC lowering zeroes the GC pointers of an allocation as
+            // its bundles direct, which the shadow needs just as the primal.
+            SmallVector<OperandBundleDef, 2> Defs;
+            if (hasJuliaAllocInitBundle(&call)) {
+              SmallVector<ValueType, 2> BundleTypes(args.size(),
+                                                    ValueType::Primal);
+              Defs = gutils->getInvertedBundles(&call, BundleTypes, bb,
+                                                /*lookup*/ false);
+            }
             auto rule = [&]() {
               Value *anti =
                   bb.CreateCall(call.getFunctionType(), call.getCalledOperand(),
-                                args, call.getName() + "'mi");
+                                args, Defs, call.getName() + "'mi");
               cast<CallInst>(anti)->setAttributes(call.getAttributes());
               cast<CallInst>(anti)->setCallingConv(call.getCallingConv());
               cast<CallInst>(anti)->setTailCallKind(call.getTailCallKind());
@@ -3749,8 +3758,11 @@ bool AdjointGenerator::handleKnownCallDerivatives(
                   (Mode == DerivativeMode::ForwardModeSplit &&
                    backwardsShadow)) {
                 if (!inLoop) {
+                  // A shadow which is moved back to the stack below loses
+                  // its bundles, and with them Julia's zeroing.
+                  bool staysCall = !hasMetadata(&call, "enzyme_fromstack");
                   zeroKnownAllocation(bb, anti, args, funcName, gutils->TLI,
-                                      &call);
+                                      &call, /*justAllocated*/ staysCall);
                   zeroed = true;
                 }
               }

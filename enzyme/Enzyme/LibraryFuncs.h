@@ -222,12 +222,84 @@ static inline bool isDeallocationFunction(const llvm::StringRef name,
   }
 }
 
+/// Zero the bytes of the allocation `toZero` of `allocSize` bytes which the
+/// Julia allocation-zeroing bundles on it leave alone. Julia's GC lowering
+/// zeroes the bytes those bundles name, and unlike a memset here it does so
+/// after optimization, so that no pass can move the zeroing of a GC pointer
+/// past a safepoint. Returns false, having emitted nothing, if the bundles are
+/// not of a form understood here.
+static inline bool zeroAroundJuliaAllocInit(llvm::IRBuilder<> &bb,
+                                            llvm::CallBase *toZero,
+                                            llvm::Value *dst,
+                                            llvm::Value *allocSize) {
+  using namespace llvm;
+  auto ptrOffsets = toZero->getOperandBundle("julia.gc_alloc_ptr_offsets");
+  auto zeroInit = toZero->getOperandBundle("julia.gc_alloc_zeroinit");
+  // Julia never emits both, and its lowering takes exactly two operands for
+  // the region form.
+  if ((bool(ptrOffsets) == bool(zeroInit)) ||
+      (zeroInit && zeroInit->Inputs.size() != 2))
+    return false;
+
+  auto &DL = bb.GetInsertBlock()->getModule()->getDataLayout();
+  auto i64 = Type::getInt64Ty(toZero->getContext());
+  auto i8 = Type::getInt8Ty(toZero->getContext());
+
+  // The byte ranges [begin, end) that Julia will zero, in increasing order.
+  SmallVector<std::pair<Value *, Value *>, 4> zeroed;
+  if (ptrOffsets) {
+    uint64_t ptrSize =
+        DL.getPointerSize(toZero->getType()->getPointerAddressSpace());
+    SmallVector<uint64_t, 4> offsets;
+    for (auto &inp : ptrOffsets->Inputs) {
+      auto CI = dyn_cast<ConstantInt>(inp);
+      if (!CI)
+        return false;
+      offsets.push_back(CI->getZExtValue());
+    }
+    llvm::sort(offsets);
+    for (auto off : offsets)
+      zeroed.emplace_back(ConstantInt::get(i64, off),
+                          ConstantInt::get(i64, off + ptrSize));
+  } else {
+    Value *begin = bb.CreateZExtOrTrunc(zeroInit->Inputs[0], i64);
+    Value *size = bb.CreateZExtOrTrunc(zeroInit->Inputs[1], i64);
+    zeroed.emplace_back(begin, bb.CreateAdd(begin, size));
+  }
+
+  auto zeroRange = [&](Value *begin, Value *end) {
+    auto cbegin = dyn_cast<ConstantInt>(begin);
+    auto cend = dyn_cast<ConstantInt>(end);
+    if (cbegin && cend && cbegin->getZExtValue() >= cend->getZExtValue())
+      return;
+    Value *ptr = dst;
+    if (!cbegin || !cbegin->isZero())
+      ptr = bb.CreateInBoundsGEP(i8, dst, begin);
+    auto memset = bb.CreateMemSet(ptr, ConstantInt::get(i8, 0),
+                                  bb.CreateSub(end, begin), MaybeAlign());
+    memset->addParamAttr(0, Attribute::NonNull);
+  };
+
+  Value *cur = ConstantInt::get(i64, 0);
+  for (auto &range : zeroed) {
+    zeroRange(cur, range.first);
+    cur = range.second;
+  }
+  zeroRange(cur, bb.CreateZExtOrTrunc(allocSize, i64));
+  return true;
+}
+
+/// Zero the allocation `toZero`. `justAllocated` says that `toZero` is the
+/// allocation call itself and that this runs right after it, as opposed to
+/// clearing an older allocation for reuse. Only then has Julia's GC lowering
+/// zeroed the bytes its allocation-zeroing bundles name.
 static inline void zeroKnownAllocation(llvm::IRBuilder<> &bb,
                                        llvm::Value *toZero,
                                        llvm::ArrayRef<llvm::Value *> argValues,
                                        const llvm::StringRef funcName,
                                        const llvm::TargetLibraryInfo &TLI,
-                                       llvm::CallInst *orig) {
+                                       llvm::CallInst *orig,
+                                       bool justAllocated = false) {
   using namespace llvm;
   assert(isAllocationFunction(funcName, TLI));
 
@@ -255,6 +327,12 @@ static inline void zeroKnownAllocation(llvm::IRBuilder<> &bb,
     dst_arg = bb.CreateBitCast(
         dst_arg, getInt8PtrTy(toZero->getContext(),
                               toZero->getType()->getPointerAddressSpace()));
+
+  if (justAllocated && funcName == "julia.gc_alloc_obj")
+    if (auto CB = dyn_cast<CallBase>(toZero))
+      if (hasJuliaAllocInitBundle(CB) &&
+          zeroAroundJuliaAllocInit(bb, CB, dst_arg, allocSize))
+        return;
 
   auto val_arg = ConstantInt::get(Type::getInt8Ty(toZero->getContext()), 0);
   auto len_arg =
